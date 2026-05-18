@@ -1,0 +1,422 @@
+{
+  "name": "Board - Ingest Recording or Transcript",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ingestboardrecording",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "webhook-ingest",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "webhookId": "ingestboardrecording"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Accepts either:\n//   type: 'recording'   + file_url (video URL → AssemblyAI)\n//   type: 'transcript'  + transcript_url (text file URL → fetch then store)\n\nconst body = $input.item.json.body || $input.item.json;\n\nconst type = body.type || 'recording';\nconst title = body.title || 'Untitled';\nconst category = body.category || 'General';\nconst recorded_date = body.recorded_date || new Date().toISOString().split('T')[0];\n\n// Use provided filename or derive one from the URL\nlet filename = body.filename || '';\nif (!filename) {\n  const url = body.file_url || body.transcript_url || '';\n  filename = url.split('/').pop().split('?')[0] || (type + '_' + Date.now());\n}\n\nconst file_url = body.file_url || '';           // video URL for AssemblyAI\nconst transcript_url = body.transcript_url || ''; // text file URL to fetch\n\nif (type === 'recording' && !file_url) {\n  throw new Error('type=recording requires file_url');\n}\nif (type === 'transcript' && !transcript_url) {\n  throw new Error('type=transcript requires transcript_url');\n}\n\nreturn [{\n  json: {\n    type,\n    title,\n    category,\n    recorded_date,\n    filename,\n    file_url,\n    transcript_url\n  }\n}];"
+      },
+      "id": "parse-input",
+      "name": "Parse Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "recording-check",
+              "leftValue": "={{ $json.type }}",
+              "rightValue": "recording",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "route-type",
+      "name": "Route by Type",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.transcript_url }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "id": "fetch-transcript-url",
+      "name": "Fetch Transcript from URL",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 440]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge fetched text back with metadata from Parse Input\nconst meta = $('Parse Input').item.json;\nconst fetchedText = $input.item.json.data || $input.item.json;\n\n// httpRequest with responseFormat=text puts content in the body\nconst transcriptText = (typeof fetchedText === 'string')\n  ? fetchedText\n  : JSON.stringify(fetchedText);\n\nreturn [{\n  json: {\n    type: meta.type,\n    title: meta.title,\n    category: meta.category,\n    recorded_date: meta.recorded_date,\n    filename: meta.filename,\n    transcript_text: transcriptText.trim()\n  }\n}];"
+      },
+      "id": "merge-transcript-text",
+      "name": "Merge Transcript Text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 440]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": {
+          "__rl": true,
+          "mode": "list",
+          "value": "public"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "list",
+          "value": "recordings"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "create-recording-transcript-path",
+      "name": "Create Recording (Transcript Path)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1320, 440],
+      "parameters": {
+        "query": "INSERT INTO recordings (title, category, recorded_date, filename)\nVALUES ('{{ $json.title }}', '{{ $json.category }}', '{{ $json.recorded_date }}'::date, '{{ $json.filename }}')\nON CONFLICT (filename) DO UPDATE SET title = EXCLUDED.title\nRETURNING id"
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Combine recording_id from DB with transcript text\nconst recordingId = $input.item.json.id;\nconst meta = $('Merge Transcript Text').item.json;\n\nreturn [{\n  json: {\n    recording_id: recordingId,\n    transcript_text: meta.transcript_text,\n    assemblyai_job_id: ''\n  }\n}];"
+      },
+      "id": "prep-transcript-insert-text",
+      "name": "Prep Transcript Insert (Text)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1540, 440]
+    },
+    {
+      "parameters": {
+        "query": "WITH inserted AS (\n  INSERT INTO transcripts (recording_id, full_text, assemblyai_job_id)\n  VALUES ('{{ $json.recording_id }}'::uuid, '{{ $json.transcript_text }}', NULLIF('{{ $json.assemblyai_job_id }}', ''))\n  ON CONFLICT (recording_id) DO UPDATE SET full_text = EXCLUDED.full_text\n  RETURNING id\n)\nSELECT i.id,\n  (SELECT json_agg(json_build_object('name', name, 'category', category)) FROM training_topics) AS existing_topics\nFROM inserted i"
+      },
+      "id": "create-transcript-text-path",
+      "name": "Create Transcript (Text Path)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1760, 440]
+    },
+    {
+      "parameters": {
+        "jsCode": "const row = $input.item.json;\nreturn [{\n  json: {\n    transcript_id: row.id,\n    recording_id: row.recording_id,\n    recording_title: $('Merge Transcript Text').item.json.title,\n    full_text: $('Merge Transcript Text').item.json.transcript_text,\n    existing_topics: typeof row.existing_topics === 'string'\n      ? JSON.parse(row.existing_topics)\n      : (row.existing_topics || [])\n  }\n}];"
+      },
+      "id": "prep-ai-text-path",
+      "name": "Prep AI Input (Text Path)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1980, 440]
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "xEUEnmO0og6fiLV2"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{ $json.transcript_id }}",
+            "recording_id": "={{ $json.recording_id }}",
+            "recording_title": "={{ $json.recording_title }}",
+            "full_text": "={{ $json.full_text }}",
+            "existing_topics": "={{ $json.existing_topics }}"
+          },
+          "schema": []
+        }
+      },
+      "id": "execute-ai-text-path",
+      "name": "Execute AI Processor (Text)",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [2200, 440]
+    },
+    {
+      "parameters": {
+        "query": "INSERT INTO recordings (title, category, recorded_date, filename)\nVALUES ('{{ $json.title }}', '{{ $json.category }}', '{{ $json.recorded_date }}'::date, '{{ $json.filename }}')\nON CONFLICT (filename) DO UPDATE SET title = EXCLUDED.title\nRETURNING id"
+      },
+      "id": "create-recording-video-path",
+      "name": "Create Recording (Video Path)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [900, 180]
+    },
+    {
+      "parameters": {
+        "jsCode": "const recordingId = $input.item.json.id;\nconst meta = $('Parse Input').item.json;\nreturn [{\n  json: {\n    recording_id: recordingId,\n    file_url: meta.file_url,\n    title: meta.title\n  }\n}];"
+      },
+      "id": "prep-assemblyai",
+      "name": "Prep AssemblyAI Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 180]
+    },
+    {
+      "parameters": {
+        "url": "https://api.assemblyai.com/v2/transcript",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "YOUR_ASSEMBLYAI_API_KEY"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify({ audio_url: $json.file_url, speaker_labels: true, speech_model: 'nano', webhook_url: $execution.resumeUrl }) }}",
+        "options": {}
+      },
+      "id": "submit-to-assemblyai",
+      "name": "Submit to AssemblyAI",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1320, 180]
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "wait-for-assemblyai",
+      "name": "Wait for AssemblyAI",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [1540, 180],
+      "webhookId": "assemblyai-callback"
+    },
+    {
+      "parameters": {
+        "url": "=https://api.assemblyai.com/v2/transcript/{{ $json.body.transcript_id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "YOUR_ASSEMBLYAI_API_KEY"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "fetch-assemblyai-result",
+      "name": "Fetch AssemblyAI Result",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1760, 180]
+    },
+    {
+      "parameters": {
+        "jsCode": "const result = $input.item.json;\nconst prepData = $('Prep AssemblyAI Request').item.json;\n\nreturn [{\n  json: {\n    recording_id: prepData.recording_id,\n    transcript_text: result.text || '',\n    assemblyai_job_id: result.id || ''\n  }\n}];"
+      },
+      "id": "prep-transcript-insert-video",
+      "name": "Prep Transcript Insert (Video)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1980, 180]
+    },
+    {
+      "parameters": {
+        "query": "WITH inserted AS (\n  INSERT INTO transcripts (recording_id, full_text, assemblyai_job_id)\n  VALUES ('{{ $json.recording_id }}'::uuid, '{{ $json.transcript_text }}', NULLIF('{{ $json.assemblyai_job_id }}', ''))\n  ON CONFLICT (recording_id) DO UPDATE SET full_text = EXCLUDED.full_text\n  RETURNING id\n)\nSELECT i.id,\n  (SELECT json_agg(json_build_object('name', name, 'category', category)) FROM training_topics) AS existing_topics\nFROM inserted i"
+      },
+      "id": "create-transcript-video-path",
+      "name": "Create Transcript (Video Path)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2200, 180]
+    },
+    {
+      "parameters": {
+        "jsCode": "const row = $input.item.json;\nconst prepData = $('Prep Transcript Insert (Video)').item.json;\nreturn [{\n  json: {\n    transcript_id: row.id,\n    recording_id: prepData.recording_id,\n    recording_title: $('Parse Input').item.json.title,\n    full_text: prepData.transcript_text,\n    existing_topics: typeof row.existing_topics === 'string'\n      ? JSON.parse(row.existing_topics)\n      : (row.existing_topics || [])\n  }\n}];"
+      },
+      "id": "prep-ai-video-path",
+      "name": "Prep AI Input (Video Path)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2420, 180]
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "xEUEnmO0og6fiLV2"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{ $json.transcript_id }}",
+            "recording_id": "={{ $json.recording_id }}",
+            "recording_title": "={{ $json.recording_title }}",
+            "full_text": "={{ $json.full_text }}",
+            "existing_topics": "={{ $json.existing_topics }}"
+          },
+          "schema": []
+        }
+      },
+      "id": "execute-ai-video-path",
+      "name": "Execute AI Processor (Video)",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [2640, 180]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, message: 'Processing complete' }) }}",
+        "options": {}
+      },
+      "id": "respond-success",
+      "name": "Respond Success",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2860, 300]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [{ "node": "Parse Input", "type": "main", "index": 0 }]
+      ]
+    },
+    "Parse Input": {
+      "main": [
+        [{ "node": "Route by Type", "type": "main", "index": 0 }]
+      ]
+    },
+    "Route by Type": {
+      "main": [
+        [{ "node": "Create Recording (Video Path)", "type": "main", "index": 0 }],
+        [{ "node": "Fetch Transcript from URL", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch Transcript from URL": {
+      "main": [
+        [{ "node": "Merge Transcript Text", "type": "main", "index": 0 }]
+      ]
+    },
+    "Merge Transcript Text": {
+      "main": [
+        [{ "node": "Create Recording (Transcript Path)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Create Recording (Transcript Path)": {
+      "main": [
+        [{ "node": "Prep Transcript Insert (Text)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Prep Transcript Insert (Text)": {
+      "main": [
+        [{ "node": "Create Transcript (Text Path)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Create Transcript (Text Path)": {
+      "main": [
+        [{ "node": "Prep AI Input (Text Path)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Prep AI Input (Text Path)": {
+      "main": [
+        [{ "node": "Execute AI Processor (Text)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Execute AI Processor (Text)": {
+      "main": [
+        [{ "node": "Respond Success", "type": "main", "index": 0 }]
+      ]
+    },
+    "Create Recording (Video Path)": {
+      "main": [
+        [{ "node": "Prep AssemblyAI Request", "type": "main", "index": 0 }]
+      ]
+    },
+    "Prep AssemblyAI Request": {
+      "main": [
+        [{ "node": "Submit to AssemblyAI", "type": "main", "index": 0 }]
+      ]
+    },
+    "Submit to AssemblyAI": {
+      "main": [
+        [{ "node": "Wait for AssemblyAI", "type": "main", "index": 0 }]
+      ]
+    },
+    "Wait for AssemblyAI": {
+      "main": [
+        [{ "node": "Fetch AssemblyAI Result", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch AssemblyAI Result": {
+      "main": [
+        [{ "node": "Prep Transcript Insert (Video)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Prep Transcript Insert (Video)": {
+      "main": [
+        [{ "node": "Create Transcript (Video Path)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Create Transcript (Video Path)": {
+      "main": [
+        [{ "node": "Prep AI Input (Video Path)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Prep AI Input (Video Path)": {
+      "main": [
+        [{ "node": "Execute AI Processor (Video)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Execute AI Processor (Video)": {
+      "main": [
+        [{ "node": "Respond Success", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": ""
+  },
+  "tags": []
+}
